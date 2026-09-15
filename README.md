@@ -49,7 +49,7 @@ Install the [Battlesnake CLI](https://github.com/BattlesnakeOfficial/rules/tree/
 Command to run a local game
 
 ```sh
-battlesnake play -W 11 -H 11 --name 'Python Starter Project' --url http://localhost:8000 -g solo --browser
+battlesnake play -W 11 -H 11 --name 'Gale' --url http://localhost:8000 -g solo --browser
 ```
 
 ## Next Steps
