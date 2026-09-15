@@ -93,8 +93,8 @@ def info() -> typing.Dict:
         "apiversion": "1",
         "author": "Gale",
         "color": "#4F9153",  # Smaragdine
-        "head": "default",  # TODO: Choose head
-        "tail": "default",  # TODO: Choose tail
+        "head": "ski",
+        "tail": "replit-notmark",
     }
 
 
