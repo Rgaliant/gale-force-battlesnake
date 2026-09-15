@@ -98,6 +98,11 @@ def info() -> typing.Dict:
     }
 
 
+# move() is a stateless request, so this tracks the last shout per game/snake
+# across turns - lets us only shout again when what we're doing actually changes.
+_last_shout = {}
+
+
 # start is called when your Battlesnake begins a game
 def start(game_state: typing.Dict):
     print("GAME START")
@@ -106,12 +111,24 @@ def start(game_state: typing.Dict):
 # end is called when your Battlesnake finishes a game
 def end(game_state: typing.Dict):
     print("GAME OVER\n")
+    _last_shout.pop((game_state["game"]["id"], game_state["you"]["id"]), None)
 
 
 # move is called on every turn and returns your next move
 # Valid moves are "up", "down", "left", or "right"
 # See https://docs.battlesnake.com/api/example-move for available data
 def move(game_state: typing.Dict) -> typing.Dict:
+
+    game_key = (game_state["game"]["id"], game_state["you"]["id"])
+
+    def respond(chosen_move, shout):
+        # Only include a shout when it differs from last turn's, so we're not
+        # shouting the same thing on every single move
+        response = {"move": chosen_move}
+        if _last_shout.get(game_key) != shout:
+            response["shout"] = shout
+        _last_shout[game_key] = shout
+        return response
 
     is_move_safe = {"up": True, "down": True, "left": True, "right": True}
     move_deltas = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
@@ -200,7 +217,7 @@ def move(game_state: typing.Dict) -> typing.Dict:
 
     if len(safe_moves) == 0:
         print(f"MOVE {game_state['turn']}: No safe moves detected! Moving down")
-        return {"move": "down"}
+        return respond("down", "Uh oh!")
 
     def cell_after(move):
         dx, dy = move_deltas[move]
@@ -279,6 +296,7 @@ def move(game_state: typing.Dict) -> typing.Dict:
     if food and my_health <= LOW_HEALTH:
         # Step 4 - Running low on health: food is the priority over cutting anyone off
         next_move = move_towards(target_food, candidate_moves)
+        shout = "Need food, now!"
     elif killable:
         # Step 5 - A shorter snake is within reach: squeeze its space to force a
         # head-to-head collision it can't win. Prefer prey already near a wall or
@@ -290,11 +308,13 @@ def move(game_state: typing.Dict) -> typing.Dict:
 
         nearest_prey = min(killable, key=prey_priority)
         next_move = move_claiming_most_territory(candidate_moves, [nearest_prey])
+        shout = "You're going down!"
     elif food_racer:
         # Step 5.5 - An equal-or-longer snake can reach our target food as fast as
         # we can: block/cut it off instead of racing it there, to deny it the food
         # and avoid a risky collision, rather than risk losing that race outright
         next_move = move_claiming_most_territory(candidate_moves, [food_racer])
+        shout = "That food's mine!"
     elif other_snakes:
         # Step 7 (Tron mode) - claiming board space is the top priority whenever
         # rivals are alive, but hunger pulls harder towards food the lower health
@@ -315,14 +335,17 @@ def move(game_state: typing.Dict) -> typing.Dict:
         scores = {m: combined_score(m) for m in candidate_moves}
         best_score = max(scores.values())
         next_move = random.choice([m for m in candidate_moves if scores[m] == best_score])
+        shout = "Claiming this turf!"
     elif food:
         # Step 4 - No opponents on the board: just go get food
         next_move = move_towards(target_food, candidate_moves)
+        shout = "Snack time!"
     else:
         next_move = random.choice(candidate_moves)
+        shout = "Just vibing."
 
     print(f"MOVE {game_state['turn']}: {next_move}")
-    return {"move": next_move}
+    return respond(next_move, shout)
 
 
 # Start server when `python main.py` is run
