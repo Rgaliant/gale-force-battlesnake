@@ -256,15 +256,29 @@ def move(game_state: typing.Dict) -> typing.Dict:
     my_health = game_state["you"]["health"]
     LOW_HEALTH = 25  # below this, survival trumps positioning
 
+    def manhattan(a, b):
+        return abs(a["x"] - b["x"]) + abs(a["y"] - b["y"])
+
     def closest_food_target():
-        return min(
-            food,
-            key=lambda f: abs(f["x"] - my_head["x"]) + abs(f["y"] - my_head["y"]),
-        )
+        return min(food, key=lambda f: manhattan(f, my_head))
+
+    def find_food_racer(target_food, rivals):
+        """The nearest equal-or-longer rival that can reach target_food as fast as
+        we can - racing it there risks a collision or losing the food outright."""
+        my_distance = manhattan(target_food, my_head)
+        racers = [
+            s
+            for s in rivals
+            if len(s["body"]) >= my_length and manhattan(target_food, s["body"][0]) <= my_distance
+        ]
+        return min(racers, key=lambda s: manhattan(target_food, s["body"][0])) if racers else None
+
+    target_food = closest_food_target() if food else None
+    food_racer = find_food_racer(target_food, other_snakes) if target_food else None
 
     if food and my_health <= LOW_HEALTH:
         # Step 4 - Running low on health: food is the priority over cutting anyone off
-        next_move = move_towards(closest_food_target(), candidate_moves)
+        next_move = move_towards(target_food, candidate_moves)
     elif killable:
         # Step 5 - A shorter snake is within reach: squeeze its space to force a
         # head-to-head collision it can't win. Prefer prey already near a wall or
@@ -276,19 +290,34 @@ def move(game_state: typing.Dict) -> typing.Dict:
 
         nearest_prey = min(killable, key=prey_priority)
         next_move = move_claiming_most_territory(candidate_moves, [nearest_prey])
+    elif food_racer:
+        # Step 5.5 - An equal-or-longer snake can reach our target food as fast as
+        # we can: block/cut it off instead of racing it there, to deny it the food
+        # and avoid a risky collision, rather than risk losing that race outright
+        next_move = move_claiming_most_territory(candidate_moves, [food_racer])
     elif other_snakes:
         # Step 7 (Tron mode) - claiming board space is the top priority whenever
-        # rivals are alive; food only breaks ties between equally good positions
-        scores = {m: territory_score(m, other_snakes) for m in candidate_moves}
+        # rivals are alive, but hunger pulls harder towards food the lower health
+        # gets. Both terms are normalized to board-size-independent fractions, so
+        # the same hunger weighting behaves consistently on small and large maps -
+        # territory swings between adjacent moves grow with board area, while a
+        # single move only ever changes food distance by a step or two.
+        board_cells = board_width * board_height
+        max_distance = board_width + board_height
+        hunger = max(0, 100 - my_health) / 100  # 0 at full health, rises as it drops
+
+        def combined_score(move):
+            score = territory_score(move, other_snakes) / board_cells
+            if target_food:
+                score -= hunger * (distance_to_after(target_food, move) / max_distance)
+            return score
+
+        scores = {m: combined_score(m) for m in candidate_moves}
         best_score = max(scores.values())
-        best_moves = [m for m in candidate_moves if scores[m] == best_score]
-        if food and len(best_moves) > 1:
-            next_move = move_towards(closest_food_target(), best_moves)
-        else:
-            next_move = random.choice(best_moves)
+        next_move = random.choice([m for m in candidate_moves if scores[m] == best_score])
     elif food:
         # Step 4 - No opponents on the board: just go get food
-        next_move = move_towards(closest_food_target(), candidate_moves)
+        next_move = move_towards(target_food, candidate_moves)
     else:
         next_move = random.choice(candidate_moves)
 
