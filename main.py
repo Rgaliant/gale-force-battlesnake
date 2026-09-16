@@ -50,6 +50,31 @@ def flood_fill_size(start, blocked, width, height):
     return len(visited)
 
 
+def bfs_distance(start, targets, blocked, width, height):
+    """Shortest path length from start to the nearest cell in `targets` through
+    open space, or None if none are reachable at all. A straight-line (e.g.
+    Manhattan) distance can be badly wrong once walls or a snake's own curled-up
+    body are in the way - this walks the real path instead."""
+    if not targets:
+        return None
+    if start in targets:
+        return 0
+    visited = {start}
+    queue = deque([(start, 0)])
+    while queue:
+        cell, dist = queue.popleft()
+        for neighbor in _neighbors(cell, width, height):
+            if neighbor in visited:
+                continue
+            if neighbor in targets:
+                return dist + 1
+            if neighbor in blocked:
+                continue
+            visited.add(neighbor)
+            queue.append((neighbor, dist + 1))
+    return None
+
+
 def compute_territory(sources, blocked, width, height, priority=None):
     """
     Level-synchronized multi-source BFS board-control map. `sources` is
@@ -192,10 +217,14 @@ def resolve_round(state, my_move, opp_move, width, height):
     }
 
 
-def evaluate_state(state, width, height, depth=0):
+def evaluate_state(state, width, height, depth=0, static_blocked=frozenset(), rival_info=()):
     """Score a simulated future state from our perspective - reuses the same
     flood-fill/territory-control ideas as the rest of the file, just applied to
-    a hypothetical board a few moves out instead of just the immediate one."""
+    a hypothetical board a few moves out instead of just the immediate one.
+
+    `static_blocked`/`rival_info` describe any other (non-simulated) snakes on
+    the board: their current bodies still block space and claim territory even
+    though we only simulate moves for the single nearest rival."""
     me, opp = state["me"], state["opp"]
 
     # `depth` is how many rounds of search budget remained when this terminal
@@ -216,7 +245,7 @@ def evaluate_state(state, width, height, depth=0):
     max_distance = width + height
     my_head = me["body"][0]
 
-    space_blocked = set(me["body"][1:]) | (set(opp["body"]) if opp else set())
+    space_blocked = set(me["body"][1:]) | (set(opp["body"]) if opp else set()) | static_blocked
     my_space = flood_fill_size(my_head, space_blocked, width, height)
     score = my_space / board_cells
     score += len(me["body"]) * 0.05
@@ -242,11 +271,14 @@ def evaluate_state(state, width, height, depth=0):
 
     if opp is not None:
         opp_head = opp["body"][0]
-        territory_blocked = set(me["body"][1:]) | set(opp["body"][1:])
+        territory_blocked = set(me["body"][1:]) | set(opp["body"][1:]) | static_blocked
+        sources = {"me": my_head, "opp": opp_head}
         priority = {"me": len(me["body"]), "opp": len(opp["body"])}
-        owners = compute_territory(
-            {"me": my_head, "opp": opp_head}, territory_blocked, width, height, priority
-        )
+        for i, rival in enumerate(rival_info):
+            key = f"static{i}"
+            sources[key] = rival["head"]
+            priority[key] = rival["length"]
+        owners = compute_territory(sources, territory_blocked, width, height, priority)
         opp_weight = 1.0 / (edge_distance(opp_head, width, height) + 1)
         my_area = sum(1 for o in owners.values() if o == "me") / board_cells
         opp_area = (sum(1 for o in owners.values() if o == "opp") / board_cells) * opp_weight
@@ -261,21 +293,29 @@ def evaluate_state(state, width, height, depth=0):
             score += 0.5
 
     if state["food"]:
-        nearest = min(state["food"], key=lambda f: abs(f[0] - my_head[0]) + abs(f[1] - my_head[1]))
-        distance_fraction = (abs(nearest[0] - my_head[0]) + abs(nearest[1] - my_head[1])) / max_distance
+        # Real shortest-path distance rather than straight-line Manhattan - our
+        # own curled-up body or a rival's can make the direct line to food
+        # unreachable even when a longer path around is open.
+        reachable_distance = bfs_distance(my_head, state["food"], space_blocked, width, height)
+        distance_fraction = (reachable_distance / max_distance) if reachable_distance is not None else 1.5
         hunger = max(0, 100 - me["health"]) / 100
-        score -= hunger * distance_fraction * 5
+        # Scarce food means fiercer competition for it and a real risk of being
+        # shut out entirely, so weight hunger more heavily when little is left.
+        scarcity = 1.5 if len(state["food"]) <= 2 else 1.0
+        score -= hunger * distance_fraction * 5 * scarcity
 
     return score
 
 
-def minimax(state, pending_my_move, depth, alpha, beta, turn, width, height, static_blocked, deadline):
+def minimax(
+    state, pending_my_move, depth, alpha, beta, turn, width, height, static_blocked, deadline, rival_info=()
+):
     if time.monotonic() >= deadline:
         raise TimeUp()
 
     me, opp = state["me"], state["opp"]
     if not me["alive"] or (opp is not None and not opp["alive"]) or depth <= 0:
-        return evaluate_state(state, width, height, depth)
+        return evaluate_state(state, width, height, depth, static_blocked, rival_info)
 
     if turn == 0:  # our move: maximize
         blocked = static_blocked | (set(opp["body"]) if opp else set())
@@ -284,9 +324,15 @@ def minimax(state, pending_my_move, depth, alpha, beta, turn, width, height, sta
             if opp is None:
                 # Solo lookahead: no rival ply, just resolve and keep going
                 next_state = resolve_round(state, candidate, "up", width, height)
-                value = minimax(next_state, None, depth - 1, alpha, beta, 0, width, height, static_blocked, deadline)
+                value = minimax(
+                    next_state, None, depth - 1, alpha, beta, 0, width, height,
+                    static_blocked, deadline, rival_info,
+                )
             else:
-                value = minimax(state, candidate, depth, alpha, beta, 1, width, height, static_blocked, deadline)
+                value = minimax(
+                    state, candidate, depth, alpha, beta, 1, width, height,
+                    static_blocked, deadline, rival_info,
+                )
             best = max(best, value)
             alpha = max(alpha, best)
             if alpha >= beta:
@@ -298,7 +344,10 @@ def minimax(state, pending_my_move, depth, alpha, beta, turn, width, height, sta
     best = math.inf
     for candidate in raw_legal_moves(opp["body"], blocked, width, height):
         next_state = resolve_round(state, pending_my_move, candidate, width, height)
-        value = minimax(next_state, None, depth - 1, alpha, beta, 0, width, height, static_blocked, deadline)
+        value = minimax(
+            next_state, None, depth - 1, alpha, beta, 0, width, height,
+            static_blocked, deadline, rival_info,
+        )
         best = min(best, value)
         beta = min(beta, best)
         if alpha >= beta:
@@ -314,29 +363,43 @@ def choose_move_via_search(root_moves, my_body, my_health, other_snakes, food, w
         return root_moves[0]
 
     my_head = (my_body[0]["x"], my_body[0]["y"])
+    my_length = len(my_body)
 
     if other_snakes:
-        nearest = min(
-            other_snakes,
-            key=lambda s: abs(s["body"][0]["x"] - my_head[0]) + abs(s["body"][0]["y"] - my_head[1]),
-        )
+        def distance(snake):
+            head = snake["body"][0]
+            return abs(head["x"] - my_head[0]) + abs(head["y"] - my_head[1])
+
+        # Model whichever rival is the real threat: the nearest snake that could
+        # actually beat us in a head-to-head. A closer-but-shorter snake is
+        # already handled by the root-level kill-hunt logic, so it's more
+        # valuable to spend the deep search on whoever could kill *us*.
+        threats = [s for s in other_snakes if len(s["body"]) >= my_length]
+        nearest = min(threats or other_snakes, key=distance)
+
         opp_state = {
             "body": [(seg["x"], seg["y"]) for seg in nearest["body"]],
             "health": nearest["health"],
             "alive": True,
         }
+        frozen_rivals = [s for s in other_snakes if s["id"] != nearest["id"]]
         # Frozen snakes' tails vacate each turn just like anyone else's, even
         # though we don't simulate them moving - excluding just the tail tip is
         # a cheap way to avoid treating that cell as permanently occupied.
         static_blocked = frozenset(
-            (seg["x"], seg["y"])
-            for snake in other_snakes
-            if snake["id"] != nearest["id"]
-            for seg in snake["body"][:-1]
+            (seg["x"], seg["y"]) for snake in frozen_rivals for seg in snake["body"][:-1]
+        )
+        # These snakes still claim board territory even though we don't
+        # simulate their moves - otherwise a 4-player game looks like a 1v1 to
+        # our evaluation, wildly overstating how much space is really ours.
+        rival_info = tuple(
+            {"head": (s["body"][0]["x"], s["body"][0]["y"]), "length": len(s["body"])}
+            for s in frozen_rivals
         )
     else:
         opp_state = None
         static_blocked = frozenset()
+        rival_info = ()
 
     root_state = {
         "me": {
@@ -357,9 +420,15 @@ def choose_move_via_search(root_moves, my_body, my_health, other_snakes, food, w
             for candidate in ordered_moves:
                 if opp_state is None:
                     next_state = resolve_round(root_state, candidate, "up", width, height)
-                    value = minimax(next_state, None, depth - 1, -math.inf, math.inf, 0, width, height, static_blocked, deadline)
+                    value = minimax(
+                        next_state, None, depth - 1, -math.inf, math.inf, 0, width, height,
+                        static_blocked, deadline, rival_info,
+                    )
                 else:
-                    value = minimax(root_state, candidate, depth, -math.inf, math.inf, 1, width, height, static_blocked, deadline)
+                    value = minimax(
+                        root_state, candidate, depth, -math.inf, math.inf, 1, width, height,
+                        static_blocked, deadline, rival_info,
+                    )
                 scored.append((value, candidate))
         except TimeUp:
             break
