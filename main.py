@@ -10,11 +10,14 @@
 # To get you started we've included code to prevent your Battlesnake from moving backwards.
 # For more info see docs.battlesnake.com
 
+import math
 import random
+import time
 import typing
 from collections import deque
 
 DIRECTIONS = ((0, 1), (0, -1), (-1, 0), (1, 0))
+MOVE_DELTAS = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
 
 
 def _neighbors(cell, width, height):
@@ -47,40 +50,296 @@ def flood_fill_size(start, blocked, width, height):
     return len(visited)
 
 
-def compute_territory(sources, blocked, width, height):
+def compute_territory(sources, blocked, width, height, priority=None):
     """
-    Multi-source BFS board-control map. `sources` is {owner: start_cell}.
-    Returns {cell: owner} for every reachable cell; a cell reached by two
-    owners in the same number of steps is contested and maps to None.
+    Level-synchronized multi-source BFS board-control map. `sources` is
+    {owner: start_cell}. Returns {cell: owner} for every reachable cell.
+
+    Processing one full round (one step of distance) at a time - rather than a
+    single FIFO queue - matters here: it guarantees every owner that can reach
+    a cell in the same number of steps is known before that cell is claimed and
+    expanded further, so ties can't be missed just because of visit order.
+
+    When multiple owners reach a cell in the same round, `priority` (optional,
+    {owner: comparable}) resolves it in favor of the highest-priority owner -
+    e.g. the longer snake, which would win a real head-to-head contest for that
+    tile rather than the tile going to waste. Without a priority function, or
+    on an exact tie in priority, the cell is contested and maps to None.
     """
-    best_dist = {}
+
+    def resolve(owners):
+        owners = set(owners)
+        if len(owners) == 1:
+            return next(iter(owners)), False
+        if priority is None:
+            return next(iter(owners)), True
+        best_score = max(priority.get(o, 0) for o in owners)
+        best_owners = [o for o in owners if priority.get(o, 0) == best_score]
+        return best_owners[0], len(best_owners) > 1
+
     claimant = {}
     tied = set()
-    queue = deque()
-
+    frontier = {}
     for owner, cell in sources.items():
-        if cell in blocked or cell in best_dist:
-            continue
-        best_dist[cell] = 0
-        claimant[cell] = owner
-        queue.append(cell)
+        frontier.setdefault(cell, []).append(owner)
 
-    while queue:
-        cell = queue.popleft()
-        dist = best_dist[cell]
-        owner = claimant[cell]
-        for neighbor in _neighbors(cell, width, height):
-            if neighbor in blocked:
+    while frontier:
+        next_frontier = {}
+        for cell, owners in frontier.items():
+            if cell in blocked or cell in claimant:
                 continue
-            next_dist = dist + 1
-            if neighbor not in best_dist:
-                best_dist[neighbor] = next_dist
-                claimant[neighbor] = owner
-                queue.append(neighbor)
-            elif best_dist[neighbor] == next_dist and claimant[neighbor] != owner:
-                tied.add(neighbor)
+            chosen, contested = resolve(owners)
+            claimant[cell] = chosen
+            if contested:
+                tied.add(cell)
+            for neighbor in _neighbors(cell, width, height):
+                if neighbor in blocked or neighbor in claimant:
+                    continue
+                next_frontier.setdefault(neighbor, []).append(chosen)
+        frontier = next_frontier
 
     return {cell: (None if cell in tied else owner) for cell, owner in claimant.items()}
+
+
+# --- Minimax + alpha-beta search over a simplified board simulation ---
+#
+# Battlesnake moves are simultaneous, but the standard, well-established way to
+# search this is to treat each round as two sequential plies: we pick a move
+# (maximizing), then the opponent picks theirs in response (minimizing) before
+# both are actually applied together and the round is scored. This is a
+# deliberately pessimistic approximation of simultaneous play (we assume the
+# opponent gets to react to us), which errs on the side of caution rather than
+# overconfidence. Only the single nearest rival is modeled this way; any other
+# snakes on the board are treated as stationary obstacles during the search,
+# which keeps the branching factor tractable.
+
+WIN_SCORE = 1_000_000
+LOSE_SCORE = -1_000_000
+MAX_SEARCH_DEPTH = 10  # rounds of lookahead; the time budget below is the real cap
+SEARCH_SAFETY_MARGIN = 0.1  # seconds reserved for overhead outside the search itself
+
+
+class TimeUp(Exception):
+    pass
+
+
+def raw_legal_moves(body, blocked, width, height):
+    """Cheap legal-move filter for search nodes: stay in bounds, don't run into
+    the given blocked cells or your own trailing body. Used mid-search instead
+    of the fuller Step 1-3 logic since it's called at every node of the tree."""
+    head = body[0]
+    blocked_here = blocked | set(body[1:])
+    moves = [
+        name
+        for name, (dx, dy) in MOVE_DELTAS.items()
+        if (0 <= head[0] + dx < width and 0 <= head[1] + dy < height)
+        and (head[0] + dx, head[1] + dy) not in blocked_here
+    ]
+    return moves or list(MOVE_DELTAS.keys())  # nothing survives; let evaluation punish it
+
+
+def step_snake(body, health, move, food_set):
+    dx, dy = MOVE_DELTAS[move]
+    new_head = (body[0][0] + dx, body[0][1] + dy)
+    ate = new_head in food_set
+    new_body = [new_head] + (body if ate else body[:-1])
+    new_health = 100 if ate else health - 1
+    return new_body, new_health, ate
+
+
+def resolve_round(state, my_move, opp_move, width, height):
+    """Advance the simulated state by one full round (both snakes move at
+    once), applying bounds/self/rival collisions and head-to-head resolution."""
+    me, opp = state["me"], state["opp"]
+    new_food = set(state["food"])
+
+    me_body, me_health, me_ate = step_snake(me["body"], me["health"], my_move, new_food)
+    if opp is not None:
+        opp_body, opp_health, opp_ate = step_snake(opp["body"], opp["health"], opp_move, new_food)
+    else:
+        opp_body, opp_health, opp_ate = None, None, False
+
+    if me_ate:
+        new_food.discard(me_body[0])
+    if opp_ate:
+        new_food.discard(opp_body[0])
+
+    me_head = me_body[0]
+    me_alive = me_health > 0 and 0 <= me_head[0] < width and 0 <= me_head[1] < height
+    me_alive = me_alive and me_head not in me_body[1:]
+    me_alive = me_alive and (opp is None or me_head not in opp_body[1:])
+
+    opp_alive = False
+    if opp is not None:
+        opp_head = opp_body[0]
+        opp_alive = opp_health > 0 and 0 <= opp_head[0] < width and 0 <= opp_head[1] < height
+        opp_alive = opp_alive and opp_head not in opp_body[1:]
+        opp_alive = opp_alive and opp_head not in me_body[1:]
+
+    if me_alive and opp_alive and me_body[0] == opp_body[0]:
+        # Head-to-head: the shorter snake loses; equal length, both die
+        if len(me_body) > len(opp_body):
+            opp_alive = False
+        elif len(opp_body) > len(me_body):
+            me_alive = False
+        else:
+            me_alive = opp_alive = False
+
+    return {
+        "me": {"body": me_body, "health": me_health, "alive": me_alive},
+        "opp": {"body": opp_body, "health": opp_health, "alive": opp_alive} if opp else None,
+        "food": new_food,
+    }
+
+
+def evaluate_state(state, width, height, depth=0):
+    """Score a simulated future state from our perspective - reuses the same
+    flood-fill/territory-control ideas as the rest of the file, just applied to
+    a hypothetical board a few moves out instead of just the immediate one."""
+    me, opp = state["me"], state["opp"]
+
+    # `depth` is how many rounds of search budget remained when this terminal
+    # state was reached - i.e. how early it happened. A loss that happens
+    # early (more depth left unused) is scored worse than one delayed as long
+    # as possible; a win reached early is scored better than a slow one.
+    if not me["alive"]:
+        return LOSE_SCORE - depth
+    if opp is not None and not opp["alive"]:
+        return WIN_SCORE + depth
+
+    # Every component below is normalized to a board-size-independent fraction
+    # before weighting - raw cell counts and raw distances both scale with board
+    # area/dimensions, so mixing them unnormalized silently favors whichever term
+    # happens to have bigger numbers on a given map size (this bit us once
+    # already with the un-simulated heuristic; the same fix applies here).
+    board_cells = width * height
+    max_distance = width + height
+    my_head = me["body"][0]
+
+    space_blocked = set(me["body"][1:]) | (set(opp["body"]) if opp else set())
+    score = flood_fill_size(my_head, space_blocked, width, height) / board_cells
+    score += len(me["body"]) * 0.05
+    score += me["health"] * 0.001
+
+    if opp is not None:
+        opp_head = opp["body"][0]
+        territory_blocked = set(me["body"][1:]) | set(opp["body"][1:])
+        priority = {"me": len(me["body"]), "opp": len(opp["body"])}
+        owners = compute_territory(
+            {"me": my_head, "opp": opp_head}, territory_blocked, width, height, priority
+        )
+        opp_weight = 1.0 / (edge_distance(opp_head, width, height) + 1)
+        my_area = sum(1 for o in owners.values() if o == "me") / board_cells
+        opp_area = (sum(1 for o in owners.values() if o == "opp") / board_cells) * opp_weight
+        score += (my_area - opp_area) * 3
+        score += (len(me["body"]) - len(opp["body"])) * 0.1
+
+    if state["food"]:
+        nearest = min(state["food"], key=lambda f: abs(f[0] - my_head[0]) + abs(f[1] - my_head[1]))
+        distance_fraction = (abs(nearest[0] - my_head[0]) + abs(nearest[1] - my_head[1])) / max_distance
+        hunger = max(0, 100 - me["health"]) / 100
+        score -= hunger * distance_fraction * 5
+
+    return score
+
+
+def minimax(state, pending_my_move, depth, alpha, beta, turn, width, height, static_blocked, deadline):
+    if time.monotonic() >= deadline:
+        raise TimeUp()
+
+    me, opp = state["me"], state["opp"]
+    if not me["alive"] or (opp is not None and not opp["alive"]) or depth <= 0:
+        return evaluate_state(state, width, height, depth)
+
+    if turn == 0:  # our move: maximize
+        blocked = static_blocked | (set(opp["body"]) if opp else set())
+        best = -math.inf
+        for candidate in raw_legal_moves(me["body"], blocked, width, height):
+            if opp is None:
+                # Solo lookahead: no rival ply, just resolve and keep going
+                next_state = resolve_round(state, candidate, "up", width, height)
+                value = minimax(next_state, None, depth - 1, alpha, beta, 0, width, height, static_blocked, deadline)
+            else:
+                value = minimax(state, candidate, depth, alpha, beta, 1, width, height, static_blocked, deadline)
+            best = max(best, value)
+            alpha = max(alpha, best)
+            if alpha >= beta:
+                break
+        return best
+
+    # turn == 1: rival's move in response to our already-chosen move; minimize
+    blocked = static_blocked | set(me["body"])
+    best = math.inf
+    for candidate in raw_legal_moves(opp["body"], blocked, width, height):
+        next_state = resolve_round(state, pending_my_move, candidate, width, height)
+        value = minimax(next_state, None, depth - 1, alpha, beta, 0, width, height, static_blocked, deadline)
+        best = min(best, value)
+        beta = min(beta, best)
+        if alpha >= beta:
+            break
+    return best
+
+
+def choose_move_via_search(root_moves, my_body, my_health, other_snakes, food, width, height, deadline):
+    """Iterative-deepening minimax: keeps searching one round deeper at a time
+    until the time budget runs out, then returns the best move found by the
+    deepest fully-completed search. Always returns quickly with 0 or 1 options."""
+    if len(root_moves) == 1:
+        return root_moves[0]
+
+    my_head = (my_body[0]["x"], my_body[0]["y"])
+
+    if other_snakes:
+        nearest = min(
+            other_snakes,
+            key=lambda s: abs(s["body"][0]["x"] - my_head[0]) + abs(s["body"][0]["y"] - my_head[1]),
+        )
+        opp_state = {
+            "body": [(seg["x"], seg["y"]) for seg in nearest["body"]],
+            "health": nearest["health"],
+            "alive": True,
+        }
+        static_blocked = frozenset(
+            (seg["x"], seg["y"])
+            for snake in other_snakes
+            if snake["id"] != nearest["id"]
+            for seg in snake["body"]
+        )
+    else:
+        opp_state = None
+        static_blocked = frozenset()
+
+    root_state = {
+        "me": {
+            "body": [(seg["x"], seg["y"]) for seg in my_body],
+            "health": my_health,
+            "alive": True,
+        },
+        "opp": opp_state,
+        "food": frozenset((f["x"], f["y"]) for f in food),
+    }
+
+    ordered_moves = list(root_moves)
+    best_move = ordered_moves[0]
+    depth = 1
+    while depth <= MAX_SEARCH_DEPTH:
+        try:
+            scored = []
+            for candidate in ordered_moves:
+                if opp_state is None:
+                    next_state = resolve_round(root_state, candidate, "up", width, height)
+                    value = minimax(next_state, None, depth - 1, -math.inf, math.inf, 0, width, height, static_blocked, deadline)
+                else:
+                    value = minimax(root_state, candidate, depth, -math.inf, math.inf, 1, width, height, static_blocked, deadline)
+                scored.append((value, candidate))
+        except TimeUp:
+            break
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        best_move = scored[0][1]
+        ordered_moves = [candidate for _, candidate in scored]  # best-first next iteration
+        depth += 1
+
+    return best_move
 
 
 # info is called when you create your Battlesnake on play.battlesnake.com
@@ -119,6 +378,7 @@ def end(game_state: typing.Dict):
 # See https://docs.battlesnake.com/api/example-move for available data
 def move(game_state: typing.Dict) -> typing.Dict:
 
+    start_time = time.monotonic()
     game_key = (game_state["game"]["id"], game_state["you"]["id"])
 
     def respond(chosen_move, shout):
@@ -131,7 +391,6 @@ def move(game_state: typing.Dict) -> typing.Dict:
         return response
 
     is_move_safe = {"up": True, "down": True, "left": True, "right": True}
-    move_deltas = {"up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)}
 
     # We've included code to prevent your Battlesnake from moving backwards
     my_head = game_state["you"]["body"][0]  # Coordinates of your head
@@ -199,10 +458,10 @@ def move(game_state: typing.Dict) -> typing.Dict:
 
         opp_head = snake["body"][0]
         opp_next_heads = {
-            (opp_head["x"] + dx, opp_head["y"] + dy) for dx, dy in move_deltas.values()
+            (opp_head["x"] + dx, opp_head["y"] + dy) for dx, dy in MOVE_DELTAS.values()
         }
 
-        for move, dxdy in move_deltas.items():
+        for move, dxdy in MOVE_DELTAS.items():
             if not is_move_safe[move]:
                 continue
             dx, dy = dxdy
@@ -220,7 +479,7 @@ def move(game_state: typing.Dict) -> typing.Dict:
         return respond("down", "Uh oh!")
 
     def cell_after(move):
-        dx, dy = move_deltas[move]
+        dx, dy = MOVE_DELTAS[move]
         return (my_head["x"] + dx, my_head["y"] + dy)
 
     blocked_cells = {
@@ -234,38 +493,6 @@ def move(game_state: typing.Dict) -> typing.Dict:
         if flood_fill_size(cell_after(m), blocked_cells, board_width, board_height) >= my_length
     ]
     candidate_moves = roomy_moves if roomy_moves else safe_moves
-
-    def distance_to_after(target, move):
-        dx, dy = move_deltas[move]
-        new_x, new_y = my_head["x"] + dx, my_head["y"] + dy
-        return abs(target["x"] - new_x) + abs(target["y"] - new_y)
-
-    def move_towards(target, moves):
-        best_distance = min(distance_to_after(target, m) for m in moves)
-        best_moves = [m for m in moves if distance_to_after(target, m) == best_distance]
-        return random.choice(best_moves)
-
-    def territory_score(move, rival_snakes):
-        # Rivals already hugging a wall have less room to escape into, so shrinking
-        # their space further is weighted as more valuable than doing the same to a
-        # rival out in the open middle of the board.
-        sources = {"me": cell_after(move)}
-        rival_weight = {}
-        for i, snake in enumerate(rival_snakes):
-            head = (snake["body"][0]["x"], snake["body"][0]["y"])
-            rival_id = f"rival{i}"
-            sources[rival_id] = head
-            rival_weight[rival_id] = 1.0 / (edge_distance(head, board_width, board_height) + 1)
-
-        owners = compute_territory(sources, blocked_cells, board_width, board_height)
-        my_area = sum(1 for o in owners.values() if o == "me")
-        rival_area = sum(rival_weight[o] for o in owners.values() if o in rival_weight)
-        return my_area - rival_area
-
-    def move_claiming_most_territory(moves, rival_snakes):
-        scores = {m: territory_score(m, rival_snakes) for m in moves}
-        best_score = max(scores.values())
-        return random.choice([m for m in moves if scores[m] == best_score])
 
     other_snakes = [s for s in opponents if s["id"] != game_state["you"]["id"]]
     killable = [s for s in other_snakes if len(s["body"]) < my_length]
@@ -293,56 +520,39 @@ def move(game_state: typing.Dict) -> typing.Dict:
     target_food = closest_food_target() if food else None
     food_racer = find_food_racer(target_food, other_snakes) if target_food else None
 
+    # A quick read on the situation, purely to pick a fitting shout - the actual
+    # move comes from below, not from these conditions.
     if food and my_health <= LOW_HEALTH:
-        # Step 4 - Running low on health: food is the priority over cutting anyone off
-        next_move = move_towards(target_food, candidate_moves)
         shout = "Need food, now!"
     elif killable:
-        # Step 5 - A shorter snake is within reach: squeeze its space to force a
-        # head-to-head collision it can't win. Prefer prey already near a wall or
-        # corner over merely-closer prey out in the open - they're easier to trap.
-        def prey_priority(snake):
-            head = (snake["body"][0]["x"], snake["body"][0]["y"])
-            distance = abs(head[0] - my_head["x"]) + abs(head[1] - my_head["y"])
-            return distance * (edge_distance(head, board_width, board_height) + 1)
-
-        nearest_prey = min(killable, key=prey_priority)
-        next_move = move_claiming_most_territory(candidate_moves, [nearest_prey])
         shout = "You're going down!"
     elif food_racer:
-        # Step 5.5 - An equal-or-longer snake can reach our target food as fast as
-        # we can: block/cut it off instead of racing it there, to deny it the food
-        # and avoid a risky collision, rather than risk losing that race outright
-        next_move = move_claiming_most_territory(candidate_moves, [food_racer])
         shout = "That food's mine!"
     elif other_snakes:
-        # Step 7 (Tron mode) - claiming board space is the top priority whenever
-        # rivals are alive, but hunger pulls harder towards food the lower health
-        # gets. Both terms are normalized to board-size-independent fractions, so
-        # the same hunger weighting behaves consistently on small and large maps -
-        # territory swings between adjacent moves grow with board area, while a
-        # single move only ever changes food distance by a step or two.
-        board_cells = board_width * board_height
-        max_distance = board_width + board_height
-        hunger = max(0, 100 - my_health) / 100  # 0 at full health, rises as it drops
-
-        def combined_score(move):
-            score = territory_score(move, other_snakes) / board_cells
-            if target_food:
-                score -= hunger * (distance_to_after(target_food, move) / max_distance)
-            return score
-
-        scores = {m: combined_score(m) for m in candidate_moves}
-        best_score = max(scores.values())
-        next_move = random.choice([m for m in candidate_moves if scores[m] == best_score])
         shout = "Claiming this turf!"
     elif food:
-        # Step 4 - No opponents on the board: just go get food
-        next_move = move_towards(target_food, candidate_moves)
         shout = "Snack time!"
     else:
-        next_move = random.choice(candidate_moves)
         shout = "Just vibing."
+
+    if food and my_health <= LOW_HEALTH:
+        # Running low on health: go straight for food. This is a hard override
+        # rather than leaving it to the search, since a search shallow enough to
+        # miss a slow starvation a dozen turns out would otherwise let it happen.
+        def distance_after(move, target):
+            dx, dy = MOVE_DELTAS[move]
+            return abs(target["x"] - (my_head["x"] + dx)) + abs(target["y"] - (my_head["y"] + dy))
+
+        best_distance = min(distance_after(m, target_food) for m in candidate_moves)
+        next_move = random.choice(
+            [m for m in candidate_moves if distance_after(m, target_food) == best_distance]
+        )
+    else:
+        timeout_ms = game_state.get("game", {}).get("timeout", 500)
+        deadline = start_time + max(0.05, timeout_ms / 1000 - SEARCH_SAFETY_MARGIN)
+        next_move = choose_move_via_search(
+            candidate_moves, my_body, my_health, other_snakes, food, board_width, board_height, deadline
+        )
 
     print(f"MOVE {game_state['turn']}: {next_move}")
     return respond(next_move, shout)
