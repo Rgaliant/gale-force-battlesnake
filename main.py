@@ -217,9 +217,28 @@ def evaluate_state(state, width, height, depth=0):
     my_head = me["body"][0]
 
     space_blocked = set(me["body"][1:]) | (set(opp["body"]) if opp else set())
-    score = flood_fill_size(my_head, space_blocked, width, height) / board_cells
+    my_space = flood_fill_size(my_head, space_blocked, width, height)
+    score = my_space / board_cells
     score += len(me["body"]) * 0.05
     score += me["health"] * 0.001
+
+    # A reachable area no bigger than our own body means we likely can't fit
+    # anywhere in it - this can be true several moves deep even when the very
+    # next step looked fine, which a one-ply check can't see.
+    if my_space <= len(me["body"]):
+        score -= 5
+
+    # Tunnel awareness: having only one open neighbor cell to move into next is
+    # a much sharper danger signal than total reachable area, which can't tell
+    # a single winding corridor apart from a wide-open room of the same size.
+    my_degree = sum(1 for n in _neighbors(my_head, width, height) if n not in space_blocked)
+    if my_degree <= 1:
+        score -= 0.5
+
+    # Being right against a wall costs us mobility regardless of who's around -
+    # separate from (and in addition to) the edge-cutoff bonus for the rival.
+    if edge_distance(my_head, width, height) == 0:
+        score -= 0.1
 
     if opp is not None:
         opp_head = opp["body"][0]
@@ -233,6 +252,13 @@ def evaluate_state(state, width, height, depth=0):
         opp_area = (sum(1 for o in owners.values() if o == "opp") / board_cells) * opp_weight
         score += (my_area - opp_area) * 3
         score += (len(me["body"]) - len(opp["body"])) * 0.1
+
+        # Funneling the rival into a tunnel is as good for us as avoiding one
+        # ourselves is - mirror image of the self-tunnel check above.
+        opp_blocked = set(opp["body"][1:]) | set(me["body"])
+        opp_degree = sum(1 for n in _neighbors(opp_head, width, height) if n not in opp_blocked)
+        if opp_degree <= 1:
+            score += 0.5
 
     if state["food"]:
         nearest = min(state["food"], key=lambda f: abs(f[0] - my_head[0]) + abs(f[1] - my_head[1]))
@@ -299,11 +325,14 @@ def choose_move_via_search(root_moves, my_body, my_health, other_snakes, food, w
             "health": nearest["health"],
             "alive": True,
         }
+        # Frozen snakes' tails vacate each turn just like anyone else's, even
+        # though we don't simulate them moving - excluding just the tail tip is
+        # a cheap way to avoid treating that cell as permanently occupied.
         static_blocked = frozenset(
             (seg["x"], seg["y"])
             for snake in other_snakes
             if snake["id"] != nearest["id"]
-            for seg in snake["body"]
+            for seg in snake["body"][:-1]
         )
     else:
         opp_state = None
@@ -468,16 +497,6 @@ def move(game_state: typing.Dict) -> typing.Dict:
             if (my_head["x"] + dx, my_head["y"] + dy) in opp_next_heads:
                 is_move_safe[move] = False
 
-    # Are there any safe moves left?
-    safe_moves = []
-    for move, isSafe in is_move_safe.items():
-        if isSafe:
-            safe_moves.append(move)
-
-    if len(safe_moves) == 0:
-        print(f"MOVE {game_state['turn']}: No safe moves detected! Moving down")
-        return respond("down", "Uh oh!")
-
     def cell_after(move):
         dx, dy = MOVE_DELTAS[move]
         return (my_head["x"] + dx, my_head["y"] + dy)
@@ -485,6 +504,28 @@ def move(game_state: typing.Dict) -> typing.Dict:
     blocked_cells = {
         (segment["x"], segment["y"]) for snake in opponents for segment in snake["body"]
     }
+
+    # Are there any safe moves left?
+    safe_moves = []
+    for move, isSafe in is_move_safe.items():
+        if isSafe:
+            safe_moves.append(move)
+
+    if len(safe_moves) == 0:
+        # Truly cornered: every option is doomed, so instead of a fixed fallback,
+        # pick whichever direction leaves the most room to maneuver - occasionally
+        # a fixed choice like always picking "down" is worse than any alternative.
+        def in_bounds(move):
+            x, y = cell_after(move)
+            return 0 <= x < board_width and 0 <= y < board_height
+
+        on_board_moves = [m for m in MOVE_DELTAS if in_bounds(m)] or list(MOVE_DELTAS.keys())
+        roomiest = max(
+            on_board_moves,
+            key=lambda m: flood_fill_size(cell_after(m), blocked_cells, board_width, board_height),
+        )
+        print(f"MOVE {game_state['turn']}: No safe moves detected! Going for {roomiest}")
+        return respond(roomiest, "Uh oh!")
 
     # Step 6 - Avoid moves that would trap us in a pocket too small for our own body
     roomy_moves = [
@@ -495,10 +536,16 @@ def move(game_state: typing.Dict) -> typing.Dict:
     candidate_moves = roomy_moves if roomy_moves else safe_moves
 
     other_snakes = [s for s in opponents if s["id"] != game_state["you"]["id"]]
-    killable = [s for s in other_snakes if len(s["body"]) < my_length]
     food = game_state["board"]["food"]
     my_health = game_state["you"]["health"]
-    LOW_HEALTH = 25  # below this, survival trumps positioning
+    LOW_HEALTH = 40  # below this, survival trumps positioning
+
+    # Our search only models a single nearest rival - fine for small groups, but
+    # the more snakes crowd the board the less that one-opponent model reflects
+    # what's actually happening, so hunting/blocking gets riskier than it's worth.
+    MAX_AGGRESSION_SNAKES = 3
+    aggressive_ok = len(other_snakes) <= MAX_AGGRESSION_SNAKES
+    killable = [s for s in other_snakes if len(s["body"]) < my_length] if aggressive_ok else []
 
     def manhattan(a, b):
         return abs(a["x"] - b["x"]) + abs(a["y"] - b["y"])
