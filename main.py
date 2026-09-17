@@ -255,9 +255,17 @@ def evaluate_state(state, width, height, depth=0, static_blocked=frozenset(), ri
 
     # A reachable area no bigger than our own body means we likely can't fit
     # anywhere in it - this can be true several moves deep even when the very
-    # next step looked fine, which a one-ply check can't see.
-    if my_space <= len(me["body"]):
-        score -= 5
+    # next step looked fine, which a one-ply check can't see. This is a ramp
+    # rather than a cliff deliberately: a flat penalty that only kicks in at
+    # the danger threshold gives the search nothing to climb away from until
+    # it's already there, which is often too late to route around. Starting
+    # the penalty at 2x body length - well before the old threshold - gives
+    # a gradient the search can act on several moves before space runs out.
+    SAFE_SPACE_RATIO = 2.0
+    TIGHT_SPACE_WEIGHT = 5  # matches the old flat -5 penalty exactly at ratio == 1.0
+    space_ratio = my_space / max(1, len(me["body"]))
+    if space_ratio < SAFE_SPACE_RATIO:
+        score -= (SAFE_SPACE_RATIO - space_ratio) * TIGHT_SPACE_WEIGHT
 
     # Tunnel awareness: having only one open neighbor cell to move into next is
     # a much sharper danger signal than total reachable area, which can't tell
