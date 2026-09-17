@@ -34,10 +34,10 @@ def edge_distance(cell, width, height):
     return min(x, width - 1 - x, y, height - 1 - y)
 
 
-def flood_fill_size(start, blocked, width, height):
-    """Count cells reachable from start through open space, via BFS."""
+def flood_fill_cells(start, blocked, width, height):
+    """The set of cells reachable from start through open space, via BFS."""
     if start in blocked:
-        return 0
+        return set()
     visited = {start}
     queue = deque([start])
     while queue:
@@ -47,7 +47,33 @@ def flood_fill_size(start, blocked, width, height):
                 continue
             visited.add(neighbor)
             queue.append(neighbor)
-    return len(visited)
+    return visited
+
+
+def flood_fill_size(start, blocked, width, height):
+    """Count cells reachable from start through open space, via BFS."""
+    return len(flood_fill_cells(start, blocked, width, height))
+
+
+def tail_following_credit(reachable, tails, width, height):
+    """Snake bodies aren't really walls - they vacate tail-first, one cell per
+    turn. A pocket whose edge touches a snake's tail therefore opens up over
+    time, and a raw flood fill badly understates how much room it offers: you
+    can follow the vacating tail (your own included - that's how a coiled
+    snake escapes its own coil). For each snake whose tail is on or next to
+    the reachable region, credit half that snake's body length as extra
+    effective space - "half" because by the time you've followed a tail that
+    far, the snake has usually looped back and re-blocked the rest.
+
+    `tails` is a list of (tail_cell, body_length) for every snake on the
+    board, ours included."""
+    credit = 0
+    for tail_cell, body_length in tails:
+        if tail_cell in reachable or any(
+            n in reachable for n in _neighbors(tail_cell, width, height)
+        ):
+            credit += body_length // 2
+    return credit
 
 
 def bfs_distance(start, targets, blocked, width, height):
@@ -247,8 +273,17 @@ def evaluate_state(state, width, height, depth=0, static_blocked=frozenset(), ri
     max_distance = width + height
     my_head = me["body"][0]
 
+    # Tails of every snake on the board (ours included): cells adjacent to a
+    # tail are worth more than raw flood fill suggests, since tails vacate.
+    tails = [(me["body"][-1], len(me["body"]))]
+    if opp is not None:
+        tails.append((opp["body"][-1], len(opp["body"])))
+    for rival in rival_info:
+        tails.append((rival["tail"], rival["length"]))
+
     space_blocked = set(me["body"][1:]) | (set(opp["body"]) if opp else set()) | static_blocked
-    my_space = flood_fill_size(my_head, space_blocked, width, height)
+    my_cells = flood_fill_cells(my_head, space_blocked, width, height)
+    my_space = len(my_cells) + tail_following_credit(my_cells, tails, width, height)
     score = my_space / board_cells
     score += len(me["body"]) * 0.05
     score += me["health"] * 0.001
@@ -289,7 +324,8 @@ def evaluate_state(state, width, height, depth=0, static_blocked=frozenset(), ri
         # any cell we both could reach. Catches "I'm in a big open room, they're
         # cramped" even before our territories are actually contesting anything.
         opp_space_blocked = set(opp["body"][1:]) | set(me["body"]) | static_blocked
-        opp_space = flood_fill_size(opp_head, opp_space_blocked, width, height)
+        opp_cells = flood_fill_cells(opp_head, opp_space_blocked, width, height)
+        opp_space = len(opp_cells) + tail_following_credit(opp_cells, tails, width, height)
         score += (my_space - opp_space) / board_cells
 
         territory_blocked = set(me["body"][1:]) | set(opp["body"][1:]) | static_blocked
@@ -360,7 +396,8 @@ def precompute_frozen_snapshots(frozen_bodies, world_blocked, width, height, dep
         # tail does, so treating it as permanently occupied is overly cautious.
         blocked = frozenset(cell for body in bodies for cell in body[:-1])
         rival_info = tuple(
-            {"head": body[0], "length": length} for body, length in zip(bodies, lengths)
+            {"head": body[0], "tail": body[-1], "length": length}
+            for body, length in zip(bodies, lengths)
         )
         return blocked, rival_info
 
@@ -681,12 +718,21 @@ def move(game_state: typing.Dict) -> typing.Dict:
         print(f"MOVE {game_state['turn']}: No safe moves detected! Going for {roomiest}")
         return respond(roomiest, "Uh oh!")
 
-    # Step 6 - Avoid moves that would trap us in a pocket too small for our own body
-    roomy_moves = [
-        m
-        for m in safe_moves
-        if flood_fill_size(cell_after(m), blocked_cells, board_width, board_height) >= my_length
+    # Step 6 - Avoid moves that would trap us in a pocket too small for our own body.
+    # Same tail-following credit as the search eval: a pocket bordered by a tail
+    # opens up as that snake moves, so it's roomier than a raw flood fill says -
+    # without this, the filter would discard tail-chase escapes before the
+    # search ever got to consider them.
+    root_tails = [
+        ((snake["body"][-1]["x"], snake["body"][-1]["y"]), len(snake["body"]))
+        for snake in opponents
     ]
+
+    def effective_room(move):
+        cells = flood_fill_cells(cell_after(move), blocked_cells, board_width, board_height)
+        return len(cells) + tail_following_credit(cells, root_tails, board_width, board_height)
+
+    roomy_moves = [m for m in safe_moves if effective_room(m) >= my_length]
     candidate_moves = roomy_moves if roomy_moves else safe_moves
 
     other_snakes = [s for s in opponents if s["id"] != game_state["you"]["id"]]
