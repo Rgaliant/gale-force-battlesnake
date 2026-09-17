@@ -1,11 +1,12 @@
-FROM python:3.10.6-slim
+# Build the Go engine
+FROM golang:1.24-alpine AS build
+COPY gosnake /src/gosnake
+WORKDIR /src/gosnake
+RUN CGO_ENABLED=0 go build -trimpath -o /gosnake .
 
-# Install app
-COPY . /usr/app
-WORKDIR /usr/app
-
-# Install dependencies
-RUN pip install --upgrade pip && pip install -r requirements.txt
-
-# Run Battlesnake
-CMD [ "python", "main.py" ]
+# Run it
+FROM alpine:3.20
+COPY --from=build /gosnake /gosnake
+ENV PORT=8000
+EXPOSE 8000
+CMD ["/gosnake"]

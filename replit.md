@@ -1,20 +1,34 @@
 # Project setup
 
-This is a Python 3 Flask Battlesnake server.
+This repo contains two Battlesnake engines:
+
+- **`gosnake/` — the Go engine (what gets deployed).** Bitboard state,
+  Voronoi eval, full N-player paranoid minimax.
+- **`main.py` — the Python engine (reference implementation).** The Go
+  engine is a port of its validated heuristics; keep it runnable for
+  A/B comparisons (`PORT=5000 python main.py`).
 
 ## Run
 
-The Replit workflow runs:
+The Replit workflow builds and runs the Go engine:
 
 ```sh
-PORT=5000 python main.py
+cd gosnake && go build -o /tmp/gosnake . && PORT=5000 /tmp/gosnake
 ```
 
-The server binds to `0.0.0.0` and exposes the Battlesnake API in the web preview:
+If the `go` module version in `.replit` (`modules = ["go-1.24"]`) isn't
+available on the current Replit image, pick the closest available Go
+module — anything >= 1.21 works (`gosnake/go.mod` targets 1.21).
+
+The server binds `0.0.0.0` and exposes the Battlesnake API:
 
 - `GET /` — snake metadata
 - `POST /start` — game start callback
 - `POST /move` — move callback
 - `POST /end` — game end callback
 
-Dependencies are declared in `requirements.txt`.
+## Tests
+
+```sh
+cd gosnake && go test ./...
+```
