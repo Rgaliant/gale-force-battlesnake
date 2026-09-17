@@ -16,9 +16,10 @@ The Replit workflow builds and runs the Go engine:
 cd gosnake && go build -o /tmp/gosnake . && PORT=5000 /tmp/gosnake
 ```
 
-Deployment runs a prebuilt static binary from `bin/` (picked by arch) —
-available on the current Replit image, pick the closest available Go
-module — anything >= 1.21 works (`gosnake/go.mod` targets 1.21).
+Deployment does NOT compile: it runs a prebuilt static Linux binary
+from `bin/`, picked by architecture. After changing the engine, rebuild
+both binaries (commands are in the `.replit` deployment comment) and
+commit them.
 
 The server binds `0.0.0.0` and exposes the Battlesnake API:
 
