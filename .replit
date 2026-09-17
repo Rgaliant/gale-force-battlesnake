@@ -34,9 +34,12 @@ outputType = "webview"
 localPort = 5000
 externalPort = 80
 
+# The deployment build and run steps execute in separate environments -
+# only the project directory carries over, so the binary must be built
+# into the project tree, never /tmp.
 [deployment]
 deploymentTarget = "cloudrun"
-build = ["sh", "-c", "cd gosnake && go build -o /tmp/gosnake ."]
+build = ["sh", "-c", "cd gosnake && go build -o ../snake-server ."]
 
 [deployment.run]
-args = ["sh", "-c", "/tmp/gosnake"]
+args = ["sh", "-c", "./snake-server"]
