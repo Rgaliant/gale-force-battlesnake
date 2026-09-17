@@ -34,12 +34,15 @@ outputType = "webview"
 localPort = 5000
 externalPort = 80
 
-# The deployment build and run steps execute in separate environments -
-# only the project directory carries over, so the binary must be built
-# into the project tree, never /tmp.
+# The deployment pipeline proved unwilling to run a build step (logs
+# show it jumping straight to the run command), so the repo ships
+# prebuilt static Linux binaries in bin/ and the run command just picks
+# one by architecture - nothing to compile at deploy time. Rebuild them
+# after engine changes:
+#   cd gosnake && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../bin/snake-linux-amd64 .
+#   cd gosnake && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o ../bin/snake-linux-arm64 .
 [deployment]
 deploymentTarget = "cloudrun"
-build = ["sh", "-c", "cd gosnake && go build -o ../snake-server ."]
 
 [deployment.run]
-args = ["sh", "-c", "./snake-server"]
+args = ["sh", "-c", "PORT=\"${PORT:-5000}\"; export PORT; case \"$(uname -m)\" in x86_64) exec bin/snake-linux-amd64;; aarch64|arm64) exec bin/snake-linux-arm64;; *) echo \"unsupported arch $(uname -m)\" >&2; exit 1;; esac"]
