@@ -135,8 +135,8 @@ def compute_territory(sources, blocked, width, height, priority=None):
 # deliberately pessimistic approximation of simultaneous play (we assume the
 # opponent gets to react to us), which errs on the side of caution rather than
 # overconfidence. Only the single nearest rival is modeled this way; any other
-# snakes on the board are treated as stationary obstacles during the search,
-# which keeps the branching factor tractable.
+# snakes on the board are walked forward along a cheap precomputed greedy path
+# instead of being fully searched, which keeps the branching factor tractable.
 
 WIN_SCORE = 1_000_000
 LOSE_SCORE = -1_000_000
@@ -223,8 +223,10 @@ def evaluate_state(state, width, height, depth=0, static_blocked=frozenset(), ri
     a hypothetical board a few moves out instead of just the immediate one.
 
     `static_blocked`/`rival_info` describe any other (non-simulated) snakes on
-    the board: their current bodies still block space and claim territory even
-    though we only simulate moves for the single nearest rival."""
+    the board: their bodies - walked forward along a cheap predicted path
+    rather than held fixed at their current position - still block space and
+    claim territory even though we only simulate moves for the single nearest
+    rival."""
     me, opp = state["me"], state["opp"]
 
     # `depth` is how many rounds of search budget remained when this terminal
@@ -271,6 +273,17 @@ def evaluate_state(state, width, height, depth=0, static_blocked=frozenset(), ri
 
     if opp is not None:
         opp_head = opp["body"][0]
+
+        # Independent flood fill from the opponent's head - unlike the shared
+        # Voronoi split below, this doesn't apportion contested cells between
+        # us. It answers a different question: how much room does each of us
+        # have to maneuver in on our own, regardless of who'd win a race for
+        # any cell we both could reach. Catches "I'm in a big open room, they're
+        # cramped" even before our territories are actually contesting anything.
+        opp_space_blocked = set(opp["body"][1:]) | set(me["body"]) | static_blocked
+        opp_space = flood_fill_size(opp_head, opp_space_blocked, width, height)
+        score += (my_space - opp_space) / board_cells
+
         territory_blocked = set(me["body"][1:]) | set(opp["body"][1:]) | static_blocked
         sources = {"me": my_head, "opp": opp_head}
         priority = {"me": len(me["body"]), "opp": len(opp["body"])}
@@ -307,18 +320,79 @@ def evaluate_state(state, width, height, depth=0, static_blocked=frozenset(), ri
     return score
 
 
+def greedy_rival_step(body, blocked, width, height):
+    """Pick the neighbor maximizing the mover's own flood-fill reachable area -
+    a cheap self-interested stand-in for how a rival we aren't fully searching
+    would probably move (chasing its own space, not modeled as reacting to us).
+    Returns None if every neighbor is blocked."""
+    candidates = [n for n in _neighbors(body[0], width, height) if n not in blocked]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda n: flood_fill_size(n, blocked, width, height))
+
+
+def precompute_frozen_snapshots(frozen_bodies, world_blocked, width, height, depth):
+    """Rivals we aren't fully searching used to be held perfectly still for the
+    whole lookahead - accurate for the next move or two, but a snake that never
+    moves in our simulated future can't be seen expanding its space or closing
+    off a corridor several rounds out. Instead, give each one a cheap path
+    computed once up front: greedily chase its own flood-fill space each round.
+    `world_blocked` (our body and the one rival we ARE modeling, at their
+    current positions) is held fixed for the whole path - these snakes aren't
+    reactive to whatever we or the modeled rival hypothetically do deeper in
+    the tree, just given one plausible trajectory computed once.
+
+    Returns a tuple indexed by rounds-elapsed-since-now, each entry a
+    (blocked_cells, rival_info) pair in the shape evaluate_state expects."""
+    bodies = [list(body) for body in frozen_bodies]
+    lengths = [len(body) for body in bodies]
+
+    def snapshot_for(bodies):
+        # Exclude each tail tip: it vacates next turn just like any snake's
+        # tail does, so treating it as permanently occupied is overly cautious.
+        blocked = frozenset(cell for body in bodies for cell in body[:-1])
+        rival_info = tuple(
+            {"head": body[0], "length": length} for body, length in zip(bodies, lengths)
+        )
+        return blocked, rival_info
+
+    snapshots = [snapshot_for(bodies)]
+    for _ in range(depth):
+        next_bodies = []
+        for i, body in enumerate(bodies):
+            # Other frozen rivals block each other too, using their positions
+            # from the start of this round - all frozen rivals step
+            # simultaneously, same as real Battlesnake turns.
+            other_frozen = {cell for j, b in enumerate(bodies) if j != i for cell in b}
+            step_blocked = world_blocked | other_frozen | set(body[1:])
+            next_head = greedy_rival_step(body, step_blocked, width, height)
+            next_bodies.append(body if next_head is None else [next_head] + body[:-1])
+        bodies = next_bodies
+        snapshots.append(snapshot_for(bodies))
+    return tuple(snapshots)
+
+
+def frozen_at(frozen_snapshots, elapsed):
+    """Look up the (blocked_cells, rival_info) snapshot for how many rounds of
+    the search have elapsed, clamped to the deepest one precomputed."""
+    index = elapsed if elapsed < len(frozen_snapshots) else len(frozen_snapshots) - 1
+    return frozen_snapshots[index]
+
+
 def minimax(
-    state, pending_my_move, depth, alpha, beta, turn, width, height, static_blocked, deadline, rival_info=()
+    state, pending_my_move, depth, alpha, beta, turn, width, height, frozen_snapshots, deadline, elapsed=0
 ):
     if time.monotonic() >= deadline:
         raise TimeUp()
 
     me, opp = state["me"], state["opp"]
     if not me["alive"] or (opp is not None and not opp["alive"]) or depth <= 0:
-        return evaluate_state(state, width, height, depth, static_blocked, rival_info)
+        blocked, rival_info = frozen_at(frozen_snapshots, elapsed)
+        return evaluate_state(state, width, height, depth, blocked, rival_info)
 
     if turn == 0:  # our move: maximize
-        blocked = static_blocked | (set(opp["body"]) if opp else set())
+        frozen_blocked, _ = frozen_at(frozen_snapshots, elapsed)
+        blocked = frozen_blocked | (set(opp["body"]) if opp else set())
         best = -math.inf
         for candidate in raw_legal_moves(me["body"], blocked, width, height):
             if opp is None:
@@ -326,12 +400,12 @@ def minimax(
                 next_state = resolve_round(state, candidate, "up", width, height)
                 value = minimax(
                     next_state, None, depth - 1, alpha, beta, 0, width, height,
-                    static_blocked, deadline, rival_info,
+                    frozen_snapshots, deadline, elapsed + 1,
                 )
             else:
                 value = minimax(
                     state, candidate, depth, alpha, beta, 1, width, height,
-                    static_blocked, deadline, rival_info,
+                    frozen_snapshots, deadline, elapsed,
                 )
             best = max(best, value)
             alpha = max(alpha, best)
@@ -340,13 +414,14 @@ def minimax(
         return best
 
     # turn == 1: rival's move in response to our already-chosen move; minimize
-    blocked = static_blocked | set(me["body"])
+    frozen_blocked, _ = frozen_at(frozen_snapshots, elapsed)
+    blocked = frozen_blocked | set(me["body"])
     best = math.inf
     for candidate in raw_legal_moves(opp["body"], blocked, width, height):
         next_state = resolve_round(state, pending_my_move, candidate, width, height)
         value = minimax(
             next_state, None, depth - 1, alpha, beta, 0, width, height,
-            static_blocked, deadline, rival_info,
+            frozen_snapshots, deadline, elapsed + 1,
         )
         best = min(best, value)
         beta = min(beta, best)
@@ -383,23 +458,25 @@ def choose_move_via_search(root_moves, my_body, my_health, other_snakes, food, w
             "alive": True,
         }
         frozen_rivals = [s for s in other_snakes if s["id"] != nearest["id"]]
-        # Frozen snakes' tails vacate each turn just like anyone else's, even
-        # though we don't simulate them moving - excluding just the tail tip is
-        # a cheap way to avoid treating that cell as permanently occupied.
-        static_blocked = frozenset(
-            (seg["x"], seg["y"]) for snake in frozen_rivals for seg in snake["body"][:-1]
+        # These snakes still claim board territory and block cells even though
+        # we don't fully search their moves - otherwise a 4-player game looks
+        # like a 1v1 to our evaluation, wildly overstating how much space and
+        # safety is really ours. Rather than holding them perfectly still for
+        # the whole lookahead (which can't see them expanding their space or
+        # closing off a corridor several rounds out), each is walked forward
+        # along a cheap precomputed greedy path - see precompute_frozen_snapshots.
+        world_blocked = frozenset((seg["x"], seg["y"]) for seg in my_body) | frozenset(
+            (seg["x"], seg["y"]) for seg in nearest["body"]
         )
-        # These snakes still claim board territory even though we don't
-        # simulate their moves - otherwise a 4-player game looks like a 1v1 to
-        # our evaluation, wildly overstating how much space is really ours.
-        rival_info = tuple(
-            {"head": (s["body"][0]["x"], s["body"][0]["y"]), "length": len(s["body"])}
-            for s in frozen_rivals
+        frozen_bodies = [
+            [(seg["x"], seg["y"]) for seg in snake["body"]] for snake in frozen_rivals
+        ]
+        frozen_snapshots = precompute_frozen_snapshots(
+            frozen_bodies, world_blocked, width, height, MAX_SEARCH_DEPTH
         )
     else:
         opp_state = None
-        static_blocked = frozenset()
-        rival_info = ()
+        frozen_snapshots = ((frozenset(), ()),)
 
     root_state = {
         "me": {
@@ -422,12 +499,12 @@ def choose_move_via_search(root_moves, my_body, my_health, other_snakes, food, w
                     next_state = resolve_round(root_state, candidate, "up", width, height)
                     value = minimax(
                         next_state, None, depth - 1, -math.inf, math.inf, 0, width, height,
-                        static_blocked, deadline, rival_info,
+                        frozen_snapshots, deadline, 1,
                     )
                 else:
                     value = minimax(
                         root_state, candidate, depth, -math.inf, math.inf, 1, width, height,
-                        static_blocked, deadline, rival_info,
+                        frozen_snapshots, deadline, 0,
                     )
                 scored.append((value, candidate))
         except TimeUp:
